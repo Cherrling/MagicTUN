@@ -207,6 +207,17 @@ func (rt *RoutingTable) GetAllRoutes() []*Route {
 	return result
 }
 
+// Size returns the total number of routes in the table.
+func (rt *RoutingTable) Size() int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	count := 0
+	for _, routes := range rt.routes {
+		count += len(routes)
+	}
+	return count
+}
+
 // bestPath selects the better of two routes to the same prefix.
 // Selection order: LocalPref > shorter ASPath > lower Cost > older route.
 func (rt *RoutingTable) bestPath(a, b *Route) *Route {

@@ -24,6 +24,7 @@ type NodeConfig struct {
 	ListenAddr   string `json:"listen_addr"`
 	Socks5Addr   string `json:"socks5_addr"`
 	Socks5Auth   string `json:"socks5_auth"`
+	HealthAddr   string `json:"health_addr"`
 }
 
 // RoutingConfig holds routing-related settings.
@@ -63,6 +64,7 @@ func DefaultConfig() *Config {
 			ListenAddr: "0.0.0.0:9443",
 			Socks5Addr: "127.0.0.1:1080",
 			Socks5Auth: "noauth",
+			HealthAddr: "",
 		},
 		Routing: RoutingConfig{
 			LocalPreference:             100,

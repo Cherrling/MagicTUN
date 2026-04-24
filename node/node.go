@@ -13,6 +13,7 @@ import (
 	"github.com/example/magictun/forward"
 	"github.com/example/magictun/gossip"
 	"github.com/example/magictun/identity"
+	"github.com/example/magictun/obs"
 	"github.com/example/magictun/route"
 	"github.com/example/magictun/socks5"
 	"github.com/example/magictun/transport"
@@ -57,6 +58,10 @@ type Node struct {
 
 	// Rate limiting
 	acceptLimiter *rateLimiter
+
+	// Observability
+	healthSrv *obs.HealthServer
+	stats     *obs.Stats
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -163,8 +168,14 @@ func New(cfg *config.Config) (*Node, error) {
 		peerUDPAddrs: make(map[string]*net.UDPAddr),
 		reconnecting:  make(map[string]struct{}),
 		acceptLimiter: newRateLimiter(10, time.Second), // 10 connections/sec
+		stats:         obs.NewStats(),
 		ctx:           ctx,
 		cancel:        cancel,
+	}
+
+	// Health server
+	if cfg.Node.HealthAddr != "" {
+		n.healthSrv = obs.NewHealthServer(cfg.Node.HealthAddr, n.stats)
 	}
 
 	// Wire up cross-component callbacks
@@ -352,6 +363,17 @@ func (n *Node) Start() error {
 	n.wg.Add(1)
 	go func() { defer n.wg.Done(); n.acceptLoop() }()
 
+	// Start health server
+	if n.healthSrv != nil {
+		if err := n.healthSrv.Start(); err != nil {
+			return fmt.Errorf("health server start: %w", err)
+		}
+	}
+
+	// Stats update loop
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.statsUpdateLoop() }()
+
 	// Connect to bootstrap peers
 	n.wg.Add(1)
 	go func() { defer n.wg.Done(); n.bootstrap() }()
@@ -371,6 +393,9 @@ func (n *Node) Stop() error {
 		n.udpLn.Close()
 	}
 
+	if n.healthSrv != nil {
+		n.healthSrv.Stop()
+	}
 	n.socks5Srv.Stop()
 	n.propagator.Stop()
 	n.gossipEng.Stop()
@@ -802,6 +827,21 @@ func (n *Node) routeGCLoop() {
 			if removed > 0 {
 				log.Printf("node: route GC removed %d stale routes", removed)
 			}
+		}
+	}
+}
+
+func (n *Node) statsUpdateLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-ticker.C:
+			peers := len(n.peers.GetAlive())
+			routes := n.routes.Size()
+			n.stats.Update(peers, routes)
 		}
 	}
 }
