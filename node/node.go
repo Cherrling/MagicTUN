@@ -40,13 +40,17 @@ type Node struct {
 	socks5Srv *socks5.Server
 
 	// UDP relay
-	udpLn      *net.UDPConn
+	udpLn          *net.UDPConn
 	peerUDPAddrs   map[string]*net.UDPAddr // nodeID -> UDP address
 	peerUDPAddrsMu sync.Mutex
 
 	// Peer connections: nodeID -> transport.Conn
 	peerConns   map[string]*transport.Conn
 	peerConnsMu sync.Mutex
+
+	// Reconnection state
+	reconnecting   map[string]struct{} // peer addrs currently being reconnected
+	reconnectingMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -116,6 +120,7 @@ func New(cfg *config.Config) (*Node, error) {
 		socks5Srv:  socks5Srv,
 		peerConns:    make(map[string]*transport.Conn),
 		peerUDPAddrs: make(map[string]*net.UDPAddr),
+		reconnecting: make(map[string]struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -448,8 +453,12 @@ func (n *Node) handleControlMessages(peerID identity.NodeID, conn *transport.Con
 			delete(n.peerConns, peerID.String())
 			n.peerConnsMu.Unlock()
 			conn.Close()
+			n.gossipEng.RemoveDirectConnection(peerID)
 			n.peers.MarkDead(peerID)
 			n.propagator.WithdrawAllFromPeer(peerID)
+
+			// Try to reconnect
+			go n.reconnectPeer(peerID)
 			return
 		}
 		n.dispatchControlMsg(peerID, buf[:nread])
@@ -541,6 +550,78 @@ func (n *Node) udpPort() string {
 		return "9443"
 	}
 	return port
+}
+
+func (n *Node) reconnectPeer(peerID identity.NodeID) {
+	// Get the peer's address from gossip
+	peer, ok := n.peers.Get(peerID)
+	if !ok || peer.Addr == "" {
+		return
+	}
+	addr := peer.Addr
+
+	n.reconnectingMu.Lock()
+	if _, already := n.reconnecting[addr]; already {
+		n.reconnectingMu.Unlock()
+		return
+	}
+	n.reconnecting[addr] = struct{}{}
+	n.reconnectingMu.Unlock()
+
+	defer func() {
+		n.reconnectingMu.Lock()
+		delete(n.reconnecting, addr)
+		n.reconnectingMu.Unlock()
+	}()
+
+	backoff := 1 * time.Second
+	maxBackoff := 60 * time.Second
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		default:
+		}
+
+		// Check if peer is still known and alive
+		if p, ok := n.peers.Get(peerID); !ok || p.State == gossip.PeerDead {
+			return
+		}
+
+		// Check if already reconnected
+		if conn := n.getPeerConn(peerID); conn != nil && !conn.IsClosed() {
+			return
+		}
+
+		log.Printf("node: reconnecting to %s (backoff %v)", peerID, backoff)
+		conn, err := transport.Dial(addr, n.tlsCfg, nil)
+		if err != nil {
+			log.Printf("node: reconnect to %s failed: %v", peerID, err)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		n.peerConnsMu.Lock()
+		n.peerConns[peerID.String()] = conn
+		n.peerConnsMu.Unlock()
+
+		n.registerPeerUDPAddr(peerID, addr)
+
+		cs := conn.ControlStream()
+		cs.Write(n.buildSelfGossipPush())
+
+		n.gossipEng.AddDirectConnection(peerID, conn)
+		n.propagator.AdvertiseDirectNetworks()
+
+		go n.handleIncomingStreams(peerID, conn)
+		n.handleControlMessages(peerID, conn, nil)
+		return
+	}
 }
 
 func (n *Node) bootstrap() {

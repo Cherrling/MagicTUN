@@ -46,6 +46,12 @@ func Dial(addr string, tlsCfg *tls.Config, pinStore *identity.PinStore) (*Conn, 
 		return nil, fmt.Errorf("tls dial: %w", err)
 	}
 
+	// Set TCP keepalive
+	if tcpConn, ok := raw.NetConn().(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	if pinStore != nil {
 		cs := raw.ConnectionState()
 		if len(cs.PeerCertificates) == 0 {
