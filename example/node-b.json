@@ -1,0 +1,31 @@
+{
+  "node": {
+    "name": "node-b",
+    "identity_file": "/tmp/magictun-node-b.key",
+    "listen_addr": "0.0.0.0:9444",
+    "socks5_addr": "127.0.0.1:1081",
+    "socks5_auth": "noauth"
+  },
+  "routing": {
+    "direct_networks": [],
+    "local_preference": 100,
+    "max_as_path_length": 32,
+    "route_advertisement_interval": "10s"
+  },
+  "gossip": {
+    "bootstrap_peers": ["127.0.0.1:9443"],
+    "push_interval": "5s",
+    "peer_timeout": "15s",
+    "probe_interval": "3s",
+    "fanout": 3
+  },
+  "udp": {
+    "session_ttl": "120s",
+    "session_gc_interval": "30s",
+    "max_datagram_size": 1200
+  },
+  "logging": {
+    "level": "info",
+    "format": "text"
+  }
+}
