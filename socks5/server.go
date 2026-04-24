@@ -17,7 +17,7 @@ type Server struct {
 	selfID identity.NodeID
 
 	// Forwarding callbacks
-	dialTCPFunc func(target string) (net.Conn, error)
+	dialTCPFunc  func(target string) (net.Conn, error)
 	dialPeerFunc func(peerID identity.NodeID, target string) (net.Conn, error)
 	udpFunc      func(clientAddr, targetAddr *net.UDPAddr) (identity.NodeID, bool) // returns nextHop
 

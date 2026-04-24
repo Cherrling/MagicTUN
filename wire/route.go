@@ -8,7 +8,7 @@ import (
 
 // RouteMessage is a path-vector route advertisement.
 type RouteMessage struct {
-	Flags     uint8    // bit 0: 0=update, 1=withdraw
+	Flags     uint8 // bit 0: 0=update, 1=withdraw
 	Prefix    net.IPNet
 	Cost      uint32
 	Origin    [NodeIDSize]byte

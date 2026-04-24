@@ -8,10 +8,9 @@ import (
 
 // Listener accepts incoming TCP+TLS connections and wraps them as Conn.
 type Listener struct {
-	ln      net.Listener
-	tlsCfg  *tls.Config
-	connCh  chan *Conn
-	errCh   chan error
+	ln     net.Listener
+	connCh chan *Conn
+	errCh  chan error
 }
 
 // Listen starts listening for incoming connections.
@@ -22,7 +21,6 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 	}
 	l := &Listener{
 		ln:     ln,
-		tlsCfg: tlsCfg,
 		connCh: make(chan *Conn, 8),
 		errCh:  make(chan error, 1),
 	}

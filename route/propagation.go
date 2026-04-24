@@ -24,8 +24,8 @@ type Propagator struct {
 
 	interval time.Duration
 
-	mu       sync.Mutex
-	stopCh   chan struct{}
+	mu     sync.Mutex
+	stopCh chan struct{}
 }
 
 // NewPropagator creates a new route propagator.

@@ -541,4 +541,3 @@ func (s *streamConn) SetDeadline(t time.Time) error {
 }
 func (s *streamConn) SetReadDeadline(t time.Time) error  { return nil }
 func (s *streamConn) SetWriteDeadline(t time.Time) error { return nil }
-

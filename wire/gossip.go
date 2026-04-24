@@ -9,10 +9,10 @@ import (
 type PeerState uint8
 
 const (
-	PeerAlive  PeerState = 0
+	PeerAlive   PeerState = 0
 	PeerSuspect PeerState = 1
-	PeerDead   PeerState = 2
-	PeerLeft   PeerState = 3
+	PeerDead    PeerState = 2
+	PeerLeft    PeerState = 3
 )
 
 // PeerEntry is a single peer in a gossip push message.
