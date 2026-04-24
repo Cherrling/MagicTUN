@@ -53,11 +53,11 @@ func (r *UDPRelay) HandleIncoming(fromPeer identity.NodeID, data []byte) {
 
 	session, ok := r.sessions.Lookup(hdr.SessionID)
 	if !ok {
-		log.Printf("udp relay: unknown session %d", hdr.SessionID)
-		return
+		// Auto-create session for the exit node case
+		session = r.sessions.CreateWithID(hdr.SessionID, nil, nil, fromPeer)
 	}
 
-	r.sessions.Touch(hdr.SessionID)
+	r.sessions.Touch(session.ID)
 
 	// Check direction
 	if fromPeer.Equal(session.NextHop) {

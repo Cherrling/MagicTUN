@@ -39,6 +39,11 @@ type Node struct {
 
 	socks5Srv *socks5.Server
 
+	// UDP relay
+	udpLn      *net.UDPConn
+	peerUDPAddrs   map[string]*net.UDPAddr // nodeID -> UDP address
+	peerUDPAddrsMu sync.Mutex
+
 	// Peer connections: nodeID -> transport.Conn
 	peerConns   map[string]*transport.Conn
 	peerConnsMu sync.Mutex
@@ -109,9 +114,10 @@ func New(cfg *config.Config) (*Node, error) {
 		udpRelay:   udpRelay,
 		sessions:   sessions,
 		socks5Srv:  socks5Srv,
-		peerConns:  make(map[string]*transport.Conn),
-		ctx:        ctx,
-		cancel:     cancel,
+		peerConns:    make(map[string]*transport.Conn),
+		peerUDPAddrs: make(map[string]*net.UDPAddr),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	// Wire up cross-component callbacks
@@ -201,10 +207,48 @@ func (n *Node) wireCallbacks() {
 		return &streamConn{stream: stream}, nil
 	})
 
-	// UDP relay: set send function
+	// UDP relay: set send function (uses dedicated UDP socket)
 	n.udpRelay.SetSendFunc(func(peerID identity.NodeID, data []byte) error {
-		// UDP relay goes over a separate UDP socket (simplified: use TCP control channel for now)
-		return n.sendControlMsg(peerID, data)
+		n.peerUDPAddrsMu.Lock()
+		addr, ok := n.peerUDPAddrs[peerID.String()]
+		n.peerUDPAddrsMu.Unlock()
+		if !ok {
+			return fmt.Errorf("no UDP address for peer %s", peerID)
+		}
+		if n.udpLn == nil {
+			return nil
+		}
+		_, err := n.udpLn.WriteTo(data, addr)
+		return err
+	})
+
+	// UDP relay: set deliver function (to local SOCKS5 client)
+	n.udpRelay.SetDeliverFunc(func(session *forward.UDPSession, data []byte) {
+		if session.ClientAddr == nil {
+			return
+		}
+		// Deliver back to the SOCKS5 UDP associate socket
+		if n.socks5Srv != nil {
+			n.socks5Srv.DeliverUDP(session.ID, data)
+		}
+	})
+
+	// SOCKS5 UDP forward callback
+	n.socks5Srv.SetUDPForward(func(nextHop identity.NodeID, sessionID uint32, targetAddr *net.UDPAddr, payload []byte) error {
+		session := n.udpRelay.CreateSession(nil, targetAddr, nextHop)
+		_ = sessionID
+		return n.udpRelay.ForwardToPeer(nextHop, session, payload)
+	})
+
+	// SOCKS5 UDP direct callback
+	n.socks5Srv.SetUDPDirect(func(targetAddr *net.UDPAddr, payload []byte) {
+		conn, err := net.DialUDP("udp", nil, targetAddr)
+		if err != nil {
+			log.Printf("node: UDP direct dial %s failed: %v", targetAddr, err)
+			return
+		}
+		defer conn.Close()
+		conn.Write(payload)
 	})
 }
 
@@ -224,6 +268,18 @@ func (n *Node) Start() error {
 	}
 	n.transportLn = ln
 	log.Printf("node: listening on %s", n.cfg.Node.ListenAddr)
+
+	// Start UDP relay listener on the same port
+	udpAddr, err := net.ResolveUDPAddr("udp", n.cfg.Node.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("udp resolve: %w", err)
+	}
+	udpLn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("udp listen: %w", err)
+	}
+	n.udpLn = udpLn
+	go n.udpReadLoop()
 
 	// Start gossip engine
 	n.gossipEng.Start()
@@ -267,6 +323,10 @@ func (n *Node) Stop() error {
 
 	if n.transportLn != nil {
 		n.transportLn.Close()
+	}
+
+	if n.udpLn != nil {
+		n.udpLn.Close()
 	}
 
 	return nil
@@ -325,6 +385,7 @@ func (n *Node) handleIncomingConn(conn *transport.Conn) {
 	n.peerConns[peerID.String()] = conn
 	n.peerConnsMu.Unlock()
 
+	n.registerPeerUDPAddr(peerID, conn.RemoteAddr().String())
 	n.gossipEng.AddDirectConnection(peerID, conn)
 
 	// Start handling incoming streams for TCP relay
@@ -352,6 +413,8 @@ func (n *Node) connectToPeer(peerID identity.NodeID, addr string) {
 	n.peerConnsMu.Lock()
 	n.peerConns[peerID.String()] = conn
 	n.peerConnsMu.Unlock()
+
+	n.registerPeerUDPAddr(peerID, addr)
 
 	// Send our gossip push immediately so the remote peer can identify us
 	cs := conn.ControlStream()
@@ -458,6 +521,28 @@ func (n *Node) getPeerConn(peerID identity.NodeID) *transport.Conn {
 	return n.peerConns[peerID.String()]
 }
 
+func (n *Node) registerPeerUDPAddr(peerID identity.NodeID, addr string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, n.udpPort()))
+	if err != nil {
+		return
+	}
+	n.peerUDPAddrsMu.Lock()
+	n.peerUDPAddrs[peerID.String()] = udpAddr
+	n.peerUDPAddrsMu.Unlock()
+}
+
+func (n *Node) udpPort() string {
+	_, port, err := net.SplitHostPort(n.cfg.Node.ListenAddr)
+	if err != nil {
+		return "9443"
+	}
+	return port
+}
+
 func (n *Node) bootstrap() {
 	for _, bp := range n.cfg.Gossip.BootstrapPeers {
 		addr := bp
@@ -502,6 +587,7 @@ func (n *Node) bootstrap() {
 		n.peerConnsMu.Unlock()
 
 		n.gossipEng.AddDirectConnection(peerID, conn)
+		n.registerPeerUDPAddr(peerID, addr)
 
 		// Start handling incoming streams for TCP relay
 		go n.handleIncomingStreams(peerID, conn)
@@ -568,6 +654,58 @@ func (n *Node) routeGCLoop() {
 			removed := n.routes.GC(routeTTL)
 			if removed > 0 {
 				log.Printf("node: route GC removed %d stale routes", removed)
+			}
+		}
+	}
+}
+
+func (n *Node) udpReadLoop() {
+	buf := make([]byte, 65536)
+	for {
+		nr, remote, err := n.udpLn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-n.ctx.Done():
+				return
+			default:
+				log.Printf("node: UDP read error: %v", err)
+				continue
+			}
+		}
+
+		// Store the peer's UDP address
+		n.peerUDPAddrsMu.Lock()
+		found := false
+		var peerID identity.NodeID
+		for id, addr := range n.peerUDPAddrs {
+			if addr.IP.Equal(remote.IP) && addr.Port == remote.Port {
+				peerID, _ = identity.ParseNodeID(id)
+				found = true
+				break
+			}
+		}
+		n.peerUDPAddrsMu.Unlock()
+
+		if found {
+			n.udpRelay.HandleIncoming(peerID, buf[:nr])
+		} else {
+			// Try to match by IP (first datagram from this peer)
+			n.peerConnsMu.Lock()
+			for id, conn := range n.peerConns {
+				host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+				if host == remote.IP.String() {
+					pid, _ := identity.ParseNodeID(id)
+					n.peerUDPAddrsMu.Lock()
+					n.peerUDPAddrs[id] = remote
+					n.peerUDPAddrsMu.Unlock()
+					n.udpRelay.HandleIncoming(pid, buf[:nr])
+					found = true
+					break
+				}
+			}
+			n.peerConnsMu.Unlock()
+			if !found {
+				log.Printf("node: UDP datagram from unknown peer %s", remote)
 			}
 		}
 	}

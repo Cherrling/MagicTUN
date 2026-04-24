@@ -55,6 +55,23 @@ func (st *SessionTable) Create(clientAddr, targetAddr *net.UDPAddr, nextHop iden
 	return s
 }
 
+// CreateWithID creates a session with a specific ID (for exit node auto-creation).
+func (st *SessionTable) CreateWithID(id uint32, clientAddr, targetAddr *net.UDPAddr, nextHop identity.NodeID) *UDPSession {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	s := &UDPSession{
+		ID:         id,
+		ClientAddr: clientAddr,
+		TargetAddr: targetAddr,
+		NextHop:    nextHop,
+		CreatedAt:  time.Now(),
+		LastUsed:   time.Now(),
+	}
+	st.sessions[id] = s
+	return s
+}
+
 // Lookup finds a session by ID.
 func (st *SessionTable) Lookup(id uint32) (*UDPSession, bool) {
 	st.mu.RLock()

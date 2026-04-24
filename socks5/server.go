@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 
 	"github.com/example/magictun/identity"
 	"github.com/example/magictun/route"
@@ -17,9 +18,14 @@ type Server struct {
 	selfID identity.NodeID
 
 	// Forwarding callbacks
-	dialTCPFunc  func(target string) (net.Conn, error)
-	dialPeerFunc func(peerID identity.NodeID, target string) (net.Conn, error)
-	udpFunc      func(clientAddr, targetAddr *net.UDPAddr) (identity.NodeID, bool) // returns nextHop
+	dialTCPFunc    func(target string) (net.Conn, error)
+	dialPeerFunc   func(peerID identity.NodeID, target string) (net.Conn, error)
+	udpForwardFunc UDPForwardFunc
+	udpDirectFunc  func(targetAddr *net.UDPAddr, payload []byte)
+
+	// Active UDP associates
+	udpAssociates map[*udpAssociate]struct{}
+	uaMu          sync.Mutex
 
 	ln     net.Listener
 	ctx    context.Context
@@ -30,11 +36,12 @@ type Server struct {
 func NewServer(addr string, routes *route.RoutingTable, selfID identity.NodeID) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		addr:   addr,
-		routes: routes,
-		selfID: selfID,
-		ctx:    ctx,
-		cancel: cancel,
+		addr:          addr,
+		routes:        routes,
+		selfID:        selfID,
+		udpAssociates: make(map[*udpAssociate]struct{}),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
@@ -48,9 +55,14 @@ func (s *Server) SetDialPeer(fn func(peerID identity.NodeID, target string) (net
 	s.dialPeerFunc = fn
 }
 
-// SetUDPFunc sets the function for UDP routing.
-func (s *Server) SetUDPFunc(fn func(clientAddr, targetAddr *net.UDPAddr) (identity.NodeID, bool)) {
-	s.udpFunc = fn
+// SetUDPForward sets the function for UDP forwarding via relay.
+func (s *Server) SetUDPForward(fn UDPForwardFunc) {
+	s.udpForwardFunc = fn
+}
+
+// SetUDPDirect sets the function for direct UDP delivery.
+func (s *Server) SetUDPDirect(fn func(targetAddr *net.UDPAddr, payload []byte)) {
+	s.udpDirectFunc = fn
 }
 
 // Start begins listening for SOCKS5 connections.
@@ -95,11 +107,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// SOCKS5 handshake
-	targetAddr, err := s.handleHandshake(conn)
+	req, err := s.handleHandshake(conn)
 	if err != nil {
 		log.Printf("socks5: handshake error: %v", err)
 		return
 	}
+
+	if req.Cmd == cmdUDPAssociate {
+		s.handleUDPAssociate(conn, req)
+		return
+	}
+
+	targetAddr := req.TargetAddr
 
 	// Route lookup
 	host, port, err := net.SplitHostPort(targetAddr)

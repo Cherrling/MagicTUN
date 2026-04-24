@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	socks5Version = 0x05
-	cmdConnect    = 0x01
+	socks5Version  = 0x05
+	cmdConnect     = 0x01
+	cmdUDPAssociate = 0x03
 
 	authNone     = 0x00
 	authNoAccept = 0xFF
@@ -29,37 +30,44 @@ const (
 	addrTypeIPv6   = 0x04
 )
 
-func (s *Server) handleHandshake(conn net.Conn) (string, error) {
+// SocksRequest holds a parsed SOCKS5 request.
+type SocksRequest struct {
+	Cmd        byte
+	TargetAddr string
+}
+
+func (s *Server) handleHandshake(conn net.Conn) (*SocksRequest, error) {
 	// Read auth methods
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return "", fmt.Errorf("read version: %w", err)
+		return nil, fmt.Errorf("read version: %w", err)
 	}
 	if buf[0] != socks5Version {
-		return "", fmt.Errorf("unsupported version: %d", buf[0])
+		return nil, fmt.Errorf("unsupported version: %d", buf[0])
 	}
 	nmethods := int(buf[1])
 	methods := make([]byte, nmethods)
 	if _, err := io.ReadFull(conn, methods); err != nil {
-		return "", fmt.Errorf("read methods: %w", err)
+		return nil, fmt.Errorf("read methods: %w", err)
 	}
 
 	// Accept no-auth
 	if _, err := conn.Write([]byte{socks5Version, authNone}); err != nil {
-		return "", fmt.Errorf("write auth response: %w", err)
+		return nil, fmt.Errorf("write auth response: %w", err)
 	}
 
 	// Read request
 	buf = make([]byte, 4)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return "", fmt.Errorf("read request header: %w", err)
+		return nil, fmt.Errorf("read request header: %w", err)
 	}
 	if buf[0] != socks5Version {
-		return "", fmt.Errorf("unsupported request version: %d", buf[0])
+		return nil, fmt.Errorf("unsupported request version: %d", buf[0])
 	}
-	if buf[1] != cmdConnect {
+	cmd := buf[1]
+	if cmd != cmdConnect && cmd != cmdUDPAssociate {
 		sendReply(conn, repCmdNotSupported, nil, 0)
-		return "", fmt.Errorf("unsupported command: %d", buf[1])
+		return nil, fmt.Errorf("unsupported command: %d", cmd)
 	}
 
 	// Read target address
@@ -68,40 +76,39 @@ func (s *Server) handleHandshake(conn net.Conn) (string, error) {
 	case addrTypeIPv4:
 		addr := make([]byte, 4)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", fmt.Errorf("read ipv4 addr: %w", err)
+			return nil, fmt.Errorf("read ipv4 addr: %w", err)
 		}
 		targetHost = net.IP(addr).String()
 	case addrTypeIPv6:
 		addr := make([]byte, 16)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", fmt.Errorf("read ipv6 addr: %w", err)
+			return nil, fmt.Errorf("read ipv6 addr: %w", err)
 		}
 		targetHost = net.IP(addr).String()
 	case addrTypeDomain:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return "", fmt.Errorf("read domain len: %w", err)
+			return nil, fmt.Errorf("read domain len: %w", err)
 		}
 		domain := make([]byte, lenBuf[0])
 		if _, err := io.ReadFull(conn, domain); err != nil {
-			return "", fmt.Errorf("read domain: %w", err)
+			return nil, fmt.Errorf("read domain: %w", err)
 		}
 		targetHost = string(domain)
 	default:
 		sendReply(conn, repAddrNotSupport, nil, 0)
-		return "", fmt.Errorf("unsupported address type: %d", buf[3])
+		return nil, fmt.Errorf("unsupported address type: %d", buf[3])
 	}
 
 	// Read port
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", fmt.Errorf("read port: %w", err)
+		return nil, fmt.Errorf("read port: %w", err)
 	}
 	port := binary.BigEndian.Uint16(portBuf)
 	targetAddr := net.JoinHostPort(targetHost, fmt.Sprintf("%d", port))
 
-	// Don't send reply here — caller sends it after establishing connection
-	return targetAddr, nil
+	return &SocksRequest{Cmd: cmd, TargetAddr: targetAddr}, nil
 }
 
 // SendSuccessReply sends a SOCKS5 success reply to the client.
