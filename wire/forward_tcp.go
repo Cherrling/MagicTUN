@@ -49,13 +49,14 @@ func EncodeTCPForwardHeader(hdr *TCPForwardHeader) []byte {
 }
 
 // DecodeTCPForwardHeader decodes a TCP forward header.
-func DecodeTCPForwardHeader(data []byte) (*TCPForwardHeader, error) {
+// Returns the header, the number of bytes consumed, and any error.
+func DecodeTCPForwardHeader(data []byte) (*TCPForwardHeader, int, error) {
 	if len(data) < 1+1+4+1+4+2 {
-		return nil, fmt.Errorf("TCP forward header too short: %d", len(data))
+		return nil, 0, fmt.Errorf("TCP forward header too short: %d", len(data))
 	}
 	off := 0
 	if data[off] != MsgTCPForward {
-		return nil, fmt.Errorf("unexpected message type: 0x%02x", data[off])
+		return nil, 0, fmt.Errorf("unexpected message type: 0x%02x", data[off])
 	}
 	off++
 
@@ -67,16 +68,17 @@ func DecodeTCPForwardHeader(data []byte) (*TCPForwardHeader, error) {
 	addrLen := int(data[off])
 	off++
 	if addrLen != 4 && addrLen != 16 {
-		return nil, fmt.Errorf("invalid address length: %d", addrLen)
+		return nil, 0, fmt.Errorf("invalid address length: %d", addrLen)
 	}
 	if off+addrLen+2 > len(data) {
-		return nil, fmt.Errorf("TCP forward header truncated at address")
+		return nil, 0, fmt.Errorf("TCP forward header truncated at address")
 	}
 	hdr.TargetAddr = make(net.IP, addrLen)
 	copy(hdr.TargetAddr, data[off:off+addrLen])
 	off += addrLen
 	hdr.TargetPort = binary.BigEndian.Uint16(data[off:])
-	return hdr, nil
+	off += 2
+	return hdr, off, nil
 }
 
 // EncodeTCPClose encodes a TCP stream close notification.

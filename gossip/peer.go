@@ -1,6 +1,7 @@
 package gossip
 
 import (
+	"crypto/ed25519"
 	"sync"
 	"time"
 
@@ -20,7 +21,8 @@ const (
 // Peer represents a known node in the network.
 type Peer struct {
 	ID         identity.NodeID
-	Addr       string // host:port for transport connection
+	PubKey     ed25519.PublicKey // Ed25519 public key (learned via gossip)
+	Addr       string            // host:port for transport connection
 	State      PeerState
 	Version    uint64 // incarnation number
 	LastSeen   time.Time
@@ -43,6 +45,7 @@ func NewPeerManager(selfID identity.NodeID) *PeerManager {
 }
 
 // AddOrUpdate adds a new peer or updates an existing one.
+// Returns true if the peer was newly added or updated.
 func (pm *PeerManager) AddOrUpdate(p *Peer) bool {
 	if p.ID.Equal(pm.selfID) {
 		return false
@@ -52,17 +55,23 @@ func (pm *PeerManager) AddOrUpdate(p *Peer) bool {
 	defer pm.mu.Unlock()
 	existing, ok := pm.peers[key]
 	if !ok {
-		p.LastSeen = time.Now()
-		p.Version = 1
-		pm.peers[key] = p
+		cp := p.copy()
+		cp.LastSeen = time.Now()
+		cp.Version = 1
+		pm.peers[key] = cp
 		return true
 	}
 	if p.Version > existing.Version || (p.Version == existing.Version && p.State == PeerAlive) {
-		existing.State = p.State
-		existing.Version = p.Version
-		existing.Addr = p.Addr
-		existing.LastSeen = time.Now()
-		existing.DirectNets = p.DirectNets
+		cp := existing.copy()
+		cp.State = p.State
+		cp.Version = p.Version
+		cp.Addr = p.Addr
+		cp.LastSeen = time.Now()
+		cp.DirectNets = p.DirectNets
+		if len(p.PubKey) > 0 {
+			cp.PubKey = p.PubKey
+		}
+		pm.peers[key] = cp
 		return true
 	}
 	return false
@@ -116,8 +125,10 @@ func (pm *PeerManager) MarkSuspect(id identity.NodeID) {
 		return
 	}
 	if p.State == PeerAlive {
-		p.State = PeerSuspect
-		p.Version++
+		cp := p.copy()
+		cp.State = PeerSuspect
+		cp.Version++
+		pm.peers[id.String()] = cp
 	}
 }
 
@@ -129,8 +140,10 @@ func (pm *PeerManager) MarkDead(id identity.NodeID) {
 	if !ok {
 		return
 	}
-	p.State = PeerDead
-	p.Version++
+	cp := p.copy()
+	cp.State = PeerDead
+	cp.Version++
+	pm.peers[id.String()] = cp
 }
 
 // MarkAlive marks a peer as alive (e.g., after receiving a pong).
@@ -141,8 +154,10 @@ func (pm *PeerManager) MarkAlive(id identity.NodeID) {
 	if !ok {
 		return
 	}
-	p.State = PeerAlive
-	p.LastSeen = time.Now()
+	cp := p.copy()
+	cp.State = PeerAlive
+	cp.LastSeen = time.Now()
+	pm.peers[id.String()] = cp
 }
 
 // GetRandom returns n random alive peers, excluding the given ID.
@@ -181,11 +196,36 @@ func (pm *PeerManager) Count(state PeerState) int {
 	return count
 }
 
-var rngState uint32 = 1
+func (p *Peer) copy() *Peer {
+	cp := &Peer{
+		ID:       p.ID,
+		Addr:     p.Addr,
+		State:    p.State,
+		Version:  p.Version,
+		LastSeen: p.LastSeen,
+	}
+	if len(p.PubKey) > 0 {
+		cp.PubKey = make([]byte, len(p.PubKey))
+		copy(cp.PubKey, p.PubKey)
+	}
+	if len(p.DirectNets) > 0 {
+		cp.DirectNets = make([]string, len(p.DirectNets))
+		copy(cp.DirectNets, p.DirectNets)
+	}
+	return cp
+}
+
+var (
+	rngMu    sync.Mutex
+	rngState uint32 = 1
+)
 
 func fastRand() uint32 {
+	rngMu.Lock()
 	rngState ^= rngState << 13
 	rngState ^= rngState >> 17
 	rngState ^= rngState << 5
-	return rngState
+	v := rngState
+	rngMu.Unlock()
+	return v
 }

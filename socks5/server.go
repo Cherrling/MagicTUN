@@ -102,7 +102,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	// Route lookup
-	host, _, err := net.SplitHostPort(targetAddr)
+	host, port, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		log.Printf("socks5: invalid target %s: %v", targetAddr, err)
 		return
@@ -117,8 +117,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 		ip = ips[0]
-		targetAddr = net.JoinHostPort(ip.String(), "0") // port from original
-		_, port, _ := net.SplitHostPort(targetAddr)
 		targetAddr = net.JoinHostPort(ip.String(), port)
 	}
 

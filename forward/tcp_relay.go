@@ -62,13 +62,13 @@ func (r *TCPRelay) RelayToPeer(peerID [16]byte, targetAddr string, localConn rea
 // This is called when a remote peer opens a stream to us for TCP forwarding.
 func (r *TCPRelay) HandleIncomingRelay(stream *transport.Stream, dialDirect func(addr string) (net.Conn, error)) error {
 	// Read the TCP forward header
-	buf := make([]byte, 1024)
+	buf := make([]byte, 32*1024)
 	n, err := stream.Read(buf)
 	if err != nil {
 		return fmt.Errorf("read forward header: %w", err)
 	}
 
-	hdr, err := wire.DecodeTCPForwardHeader(buf[:n])
+	hdr, consumed, err := wire.DecodeTCPForwardHeader(buf[:n])
 	if err != nil {
 		return fmt.Errorf("decode forward header: %w", err)
 	}
@@ -81,6 +81,13 @@ func (r *TCPRelay) HandleIncomingRelay(stream *transport.Stream, dialDirect func
 		return fmt.Errorf("dial target %s: %w", targetAddr, err)
 	}
 	defer targetConn.Close()
+
+	// Write any data that followed the header
+	if n > consumed {
+		if _, err := targetConn.Write(buf[consumed:n]); err != nil {
+			return fmt.Errorf("write remaining data: %w", err)
+		}
+	}
 
 	// Splice
 	return splice(stream, targetConn)

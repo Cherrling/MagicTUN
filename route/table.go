@@ -169,6 +169,30 @@ func (rt *RoutingTable) Lookup(ip net.IP) (*Route, bool) {
 	return bestMatch, bestMatch != nil
 }
 
+// GC removes routes older than the given TTL.
+func (rt *RoutingTable) GC(ttl time.Duration) int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	removed := 0
+	now := time.Now()
+	for key, routes := range rt.routes {
+		filtered := routes[:0]
+		for _, r := range routes {
+			if now.Sub(r.Timestamp) < ttl {
+				filtered = append(filtered, r)
+			} else {
+				removed++
+			}
+		}
+		if len(filtered) == 0 {
+			delete(rt.routes, key)
+		} else {
+			rt.routes[key] = filtered
+		}
+	}
+	return removed
+}
+
 // GetAllRoutes returns all known routes (for advertisement).
 func (rt *RoutingTable) GetAllRoutes() []*Route {
 	rt.mu.RLock()

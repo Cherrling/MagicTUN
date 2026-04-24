@@ -79,7 +79,9 @@ func New(cfg *config.Config) (*Node, error) {
 		PeerTimeout:   cfg.PeerTimeout(),
 		Fanout:        cfg.Gossip.Fanout,
 	}
-	gossipEng := gossip.NewEngine(id.ID, cfg.Node.ListenAddr, gossipCfg)
+	var pubKey [32]byte
+	copy(pubKey[:], id.PubKey)
+	gossipEng := gossip.NewEngine(id.ID, cfg.Node.ListenAddr, pubKey, gossipCfg)
 
 	// Route propagator
 	propagator := route.NewPropagator(routes, id.ID, cfg.RouteAdvertisementInterval())
@@ -119,6 +121,11 @@ func New(cfg *config.Config) (*Node, error) {
 }
 
 func (n *Node) wireCallbacks() {
+	// Set message signing on gossip engine
+	n.gossipEng.SetSignFunc(func(msg []byte) []byte {
+		return wire.SignMessage(msg, n.identity.PrivKey)
+	})
+
 	// Gossip: when a new peer is discovered, connect to it
 	n.gossipEng.OnPeerDiscovered(func(peer *gossip.Peer) {
 		go n.connectToPeer(peer.ID, peer.Addr)
@@ -232,6 +239,9 @@ func (n *Node) Start() error {
 	// Start session GC
 	go n.sessionGCLoop()
 
+	// Start route GC
+	go n.routeGCLoop()
+
 	// Accept incoming connections
 	go n.acceptLoop()
 
@@ -333,7 +343,7 @@ func (n *Node) connectToPeer(peerID identity.NodeID, addr string) {
 
 	log.Printf("node: connecting to peer %s at %s", peerID, addr)
 
-	conn, err := transport.Dial(addr, n.tlsCfg)
+	conn, err := transport.Dial(addr, n.tlsCfg, nil) // PinStore disabled: TLS certs are ephemeral
 	if err != nil {
 		log.Printf("node: dial peer %s failed: %v", peerID, err)
 		return
@@ -388,6 +398,16 @@ func (n *Node) dispatchControlMsg(from identity.NodeID, data []byte) {
 		return
 	}
 
+	// Verify signature if we know this peer's public key
+	if peer, ok := n.peers.Get(from); ok && len(peer.PubKey) > 0 {
+		verified, err := wire.VerifyMessage(data, peer.PubKey)
+		if err != nil {
+			log.Printf("node: signature verification failed from %s: %v", from, err)
+			return
+		}
+		data = verified
+	}
+
 	// Try gossip engine first
 	if n.gossipEng.HandleMessage(from, data) {
 		return
@@ -426,6 +446,7 @@ func (n *Node) sendControlMsg(peerID identity.NodeID, msg []byte) error {
 	if conn == nil {
 		return fmt.Errorf("no connection to peer %s", peerID)
 	}
+	msg = wire.SignMessage(msg, n.identity.PrivKey)
 	cs := conn.ControlStream()
 	_, err := cs.Write(msg)
 	return err
@@ -440,7 +461,7 @@ func (n *Node) getPeerConn(peerID identity.NodeID) *transport.Conn {
 func (n *Node) bootstrap() {
 	for _, bp := range n.cfg.Gossip.BootstrapPeers {
 		addr := bp
-		conn, err := transport.Dial(addr, n.tlsCfg)
+		conn, err := transport.Dial(addr, n.tlsCfg, nil) // PinStore disabled: TLS certs are ephemeral
 		if err != nil {
 			log.Printf("node: bootstrap dial %s failed: %v", addr, err)
 			continue
@@ -494,8 +515,11 @@ func (n *Node) buildSelfGossipPush() []byte {
 	entries := make([]wire.PeerEntry, 0, len(peers)+1)
 	var selfID [16]byte
 	copy(selfID[:], n.identity.ID[:])
+	var selfPubKey [32]byte
+	copy(selfPubKey[:], n.identity.PubKey)
 	entries = append(entries, wire.PeerEntry{
 		ID:      selfID,
+		PubKey:  selfPubKey,
 		State:   wire.PeerAlive,
 		Version: 1,
 		Addr:    n.cfg.Node.ListenAddr,
@@ -503,8 +527,13 @@ func (n *Node) buildSelfGossipPush() []byte {
 	for _, p := range peers {
 		var id [16]byte
 		copy(id[:], p.ID[:])
+		var pk [32]byte
+		if len(p.PubKey) == 32 {
+			copy(pk[:], p.PubKey)
+		}
 		entries = append(entries, wire.PeerEntry{
 			ID:      id,
+			PubKey:  pk,
 			State:   wire.PeerState(p.State),
 			Version: p.Version,
 			Addr:    p.Addr,
@@ -522,6 +551,24 @@ func (n *Node) sessionGCLoop() {
 			return
 		case <-ticker.C:
 			n.sessions.GC()
+		}
+	}
+}
+
+func (n *Node) routeGCLoop() {
+	// Route TTL is 3x the advertisement interval to allow for missed updates
+	routeTTL := n.cfg.RouteAdvertisementInterval() * 3
+	ticker := time.NewTicker(n.cfg.RouteAdvertisementInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-ticker.C:
+			removed := n.routes.GC(routeTTL)
+			if removed > 0 {
+				log.Printf("node: route GC removed %d stale routes", removed)
+			}
 		}
 	}
 }

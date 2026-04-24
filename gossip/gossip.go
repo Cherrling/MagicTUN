@@ -15,6 +15,7 @@ import (
 type Engine struct {
 	selfID   identity.NodeID
 	selfAddr string
+	pubKey   [32]byte
 	peers    *PeerManager
 	config   Config
 
@@ -26,6 +27,9 @@ type Engine struct {
 	onPeerDiscovered func(peer *Peer)
 	// Callback when a peer goes dead
 	onPeerDead func(id identity.NodeID)
+
+	// SignFunc signs outgoing messages with our private key.
+	signFunc func([]byte) []byte
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -50,11 +54,12 @@ func DefaultConfig() Config {
 }
 
 // NewEngine creates a new gossip engine.
-func NewEngine(selfID identity.NodeID, selfAddr string, cfg Config) *Engine {
+func NewEngine(selfID identity.NodeID, selfAddr string, pubKey [32]byte, cfg Config) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
 		selfID:   selfID,
 		selfAddr: selfAddr,
+		pubKey:   pubKey,
 		peers:    NewPeerManager(selfID),
 		config:   cfg,
 		conns:    make(map[string]*transport.Conn),
@@ -89,6 +94,11 @@ func (e *Engine) OnPeerDead(fn func(id identity.NodeID)) {
 	e.onPeerDead = fn
 }
 
+// SetSignFunc sets the function to sign outgoing messages.
+func (e *Engine) SetSignFunc(fn func([]byte) []byte) {
+	e.signFunc = fn
+}
+
 // AddDirectConnection registers a direct transport connection to a peer.
 // Sends an immediate gossip push to the new peer.
 func (e *Engine) AddDirectConnection(id identity.NodeID, conn *transport.Conn) {
@@ -105,6 +115,7 @@ func (e *Engine) AddDirectConnection(id identity.NodeID, conn *transport.Conn) {
 
 	// Send immediate gossip push to the new peer
 	msg := e.buildGossipPush()
+	msg = e.signMsg(msg)
 	cs := conn.ControlStream()
 	cs.Write(msg)
 }
@@ -150,6 +161,7 @@ func (e *Engine) RemoveDirectConnection(id identity.NodeID) {
 
 // Broadcast sends a message to all directly connected peers.
 func (e *Engine) Broadcast(msg []byte) {
+	msg = e.signMsg(msg)
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
 	for id, conn := range e.conns {
@@ -168,6 +180,7 @@ func (e *Engine) SendTo(id identity.NodeID, msg []byte) error {
 	if !ok {
 		return nil // peer not directly connected
 	}
+	msg = e.signMsg(msg)
 	cs := conn.ControlStream()
 	_, err := cs.Write(msg)
 	return err
@@ -237,7 +250,8 @@ func (e *Engine) probeRandomPeer() {
 
 	// Send ping
 	cs := conn.ControlStream()
-	if _, err := cs.Write(wire.EncodePing()); err != nil {
+	ping := e.signMsg(wire.EncodePing())
+	if _, err := cs.Write(ping); err != nil {
 		log.Printf("gossip: ping to %s failed: %v", target.ID, err)
 		e.peers.MarkSuspect(target.ID)
 		return
@@ -270,6 +284,7 @@ func (e *Engine) buildGossipPush() []byte {
 	copy(selfID[:], e.selfID[:])
 	entries = append(entries, wire.PeerEntry{
 		ID:      selfID,
+		PubKey:  e.pubKey,
 		State:   wire.PeerAlive,
 		Version: 1,
 		Addr:    e.selfAddr,
@@ -278,8 +293,13 @@ func (e *Engine) buildGossipPush() []byte {
 	for _, p := range allPeers {
 		var id [16]byte
 		copy(id[:], p.ID[:])
+		var pk [32]byte
+		if len(p.PubKey) == 32 {
+			copy(pk[:], p.PubKey)
+		}
 		entries = append(entries, wire.PeerEntry{
 			ID:      id,
+			PubKey:  pk,
 			State:   wire.PeerState(p.State),
 			Version: p.Version,
 			Addr:    p.Addr,
@@ -304,10 +324,30 @@ func (e *Engine) handlePush(msg *wire.GossipPushMessage) {
 			State:   PeerState(entry.State),
 			Version: entry.Version,
 		}
+		if !isZeroPubKey(entry.PubKey) {
+			newPeer.PubKey = make([]byte, 32)
+			copy(newPeer.PubKey, entry.PubKey[:])
+		}
 
 		isNew := e.peers.AddOrUpdate(newPeer)
 		if isNew && e.onPeerDiscovered != nil {
 			e.onPeerDiscovered(newPeer)
 		}
 	}
+}
+
+func isZeroPubKey(pk [32]byte) bool {
+	for _, b := range pk {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) signMsg(msg []byte) []byte {
+	if e.signFunc == nil {
+		return msg
+	}
+	return e.signFunc(msg)
 }

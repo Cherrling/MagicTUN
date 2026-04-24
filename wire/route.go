@@ -37,7 +37,11 @@ func EncodeRouteMessage(msg *RouteMessage) []byte {
 	off++
 	buf[off] = byte(ones)
 	off++
-	copy(buf[off:], msg.Prefix.IP.To4())
+	ip := msg.Prefix.IP.To4()
+	if ip == nil {
+		ip = msg.Prefix.IP.To16()
+	}
+	copy(buf[off:], ip)
 	off += prefixLen
 
 	binary.BigEndian.PutUint32(buf[off:], msg.Cost)
@@ -77,8 +81,15 @@ func DecodeRouteMessage(data []byte) (*RouteMessage, error) {
 	if off+prefixLen > len(data) {
 		return nil, fmt.Errorf("route message truncated at prefix")
 	}
-	ip := net.IPv4(data[off], data[off+1], data[off+2], data[off+3])
-	msg.Prefix = net.IPNet{IP: ip, Mask: net.CIDRMask(ones, 32)}
+	var ip net.IP
+	if ones <= 32 {
+		ip = net.IPv4(data[off], data[off+1], data[off+2], data[off+3])
+		msg.Prefix = net.IPNet{IP: ip, Mask: net.CIDRMask(ones, 32)}
+	} else {
+		ip = make(net.IP, 16)
+		copy(ip, data[off:off+prefixLen])
+		msg.Prefix = net.IPNet{IP: ip, Mask: net.CIDRMask(ones, 128)}
+	}
 	off += prefixLen
 
 	msg.Cost = binary.BigEndian.Uint32(data[off:])

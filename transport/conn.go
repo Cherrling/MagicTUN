@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/example/magictun/identity"
 )
 
 // Conn wraps a TCP+TLS connection with frame-based multiplexing.
@@ -37,11 +39,28 @@ type Stream struct {
 }
 
 // Dial connects to a remote peer via TCP+TLS.
-func Dial(addr string, tlsCfg *tls.Config) (*Conn, error) {
+// If pinStore is non-nil, the server's certificate is verified via TOFU pinning.
+func Dial(addr string, tlsCfg *tls.Config, pinStore *identity.PinStore) (*Conn, error) {
 	raw, err := tls.Dial("tcp", addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial: %w", err)
 	}
+
+	if pinStore != nil {
+		cs := raw.ConnectionState()
+		if len(cs.PeerCertificates) == 0 {
+			raw.Close()
+			return nil, fmt.Errorf("tls: no peer certificate")
+		}
+		if ok, err := pinStore.Check(addr, cs.PeerCertificates[0]); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("pin check: %w", err)
+		} else if !ok {
+			raw.Close()
+			return nil, fmt.Errorf("pin check failed for %s", addr)
+		}
+	}
+
 	return newConn(raw), nil
 }
 
@@ -64,16 +83,25 @@ func newConn(raw net.Conn) *Conn {
 // OpenStream creates a new outgoing stream.
 func (c *Conn) OpenStream() (*Stream, error) {
 	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
 	if c.closed {
-		c.streamsMu.Unlock()
 		return nil, net.ErrClosed
 	}
-	id := c.nextID
-	c.nextID += 2 // even IDs for outgoing
-	s := &Stream{id: id, conn: c, readCh: make(chan []byte, 16)}
-	c.streams[id] = s
-	c.streamsMu.Unlock()
-	return s, nil
+	// Find an available outgoing stream ID (odd numbers)
+	// Wrap around if we exhaust the ID space
+	for attempts := 0; attempts < 1000; attempts++ {
+		id := c.nextID
+		c.nextID += 2
+		if c.nextID < 2 { // overflow check
+			c.nextID = 1
+		}
+		if _, exists := c.streams[id]; !exists {
+			s := &Stream{id: id, conn: c, readCh: make(chan []byte, 16)}
+			c.streams[id] = s
+			return s, nil
+		}
+	}
+	return nil, fmt.Errorf("transport: no available stream IDs")
 }
 
 // AcceptStream accepts an incoming stream (from AcceptCh).

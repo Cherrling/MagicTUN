@@ -18,6 +18,7 @@ const (
 // PeerEntry is a single peer in a gossip push message.
 type PeerEntry struct {
 	ID      [NodeIDSize]byte
+	PubKey  [32]byte // Ed25519 public key
 	State   PeerState
 	Version uint64
 	Addr    string // host:port
@@ -32,7 +33,7 @@ type GossipPushMessage struct {
 func EncodeGossipPush(msg *GossipPushMessage) []byte {
 	size := 1 + 2 // type + count
 	for _, p := range msg.Peers {
-		size += NodeIDSize + 1 + 8 + 1 + len(p.Addr)
+		size += NodeIDSize + 32 + 1 + 8 + 1 + len(p.Addr)
 	}
 	buf := make([]byte, size)
 	off := 0
@@ -45,6 +46,8 @@ func EncodeGossipPush(msg *GossipPushMessage) []byte {
 	for _, p := range msg.Peers {
 		copy(buf[off:], p.ID[:])
 		off += NodeIDSize
+		copy(buf[off:], p.PubKey[:])
+		off += 32
 		buf[off] = byte(p.State)
 		off++
 		binary.BigEndian.PutUint64(buf[off:], p.Version)
@@ -73,12 +76,14 @@ func DecodeGossipPush(data []byte) (*GossipPushMessage, error) {
 
 	msg := &GossipPushMessage{Peers: make([]PeerEntry, 0, count)}
 	for i := 0; i < count; i++ {
-		if off+NodeIDSize+1+8+1 > len(data) {
+		if off+NodeIDSize+32+1+8+1 > len(data) {
 			return nil, fmt.Errorf("gossip push truncated at peer %d", i)
 		}
 		var p PeerEntry
 		copy(p.ID[:], data[off:off+NodeIDSize])
 		off += NodeIDSize
+		copy(p.PubKey[:], data[off:off+32])
+		off += 32
 		p.State = PeerState(data[off])
 		off++
 		p.Version = binary.BigEndian.Uint64(data[off:])
