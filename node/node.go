@@ -52,8 +52,49 @@ type Node struct {
 	reconnecting   map[string]struct{} // peer addrs currently being reconnected
 	reconnectingMu sync.Mutex
 
+	// Shutdown coordination
+	wg sync.WaitGroup
+
+	// Rate limiting
+	acceptLimiter *rateLimiter
+
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// rateLimiter is a simple token-bucket rate limiter.
+type rateLimiter struct {
+	mu       sync.Mutex
+	tokens   int
+	max      int
+	interval time.Duration
+	last     time.Time
+}
+
+func newRateLimiter(maxPerInterval int, interval time.Duration) *rateLimiter {
+	return &rateLimiter{
+		tokens:   maxPerInterval,
+		max:      maxPerInterval,
+		interval: interval,
+		last:     time.Now(),
+	}
+}
+
+func (rl *rateLimiter) allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(rl.last)
+	rl.last = now
+	rl.tokens += int(float64(rl.max) * float64(elapsed) / float64(rl.interval))
+	if rl.tokens > rl.max {
+		rl.tokens = rl.max
+	}
+	if rl.tokens > 0 {
+		rl.tokens--
+		return true
+	}
+	return false
 }
 
 // New creates a new Node from a configuration.
@@ -120,9 +161,10 @@ func New(cfg *config.Config) (*Node, error) {
 		socks5Srv:  socks5Srv,
 		peerConns:    make(map[string]*transport.Conn),
 		peerUDPAddrs: make(map[string]*net.UDPAddr),
-		reconnecting: make(map[string]struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
+		reconnecting:  make(map[string]struct{}),
+		acceptLimiter: newRateLimiter(10, time.Second), // 10 connections/sec
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 
 	// Wire up cross-component callbacks
@@ -284,7 +326,8 @@ func (n *Node) Start() error {
 		return fmt.Errorf("udp listen: %w", err)
 	}
 	n.udpLn = udpLn
-	go n.udpReadLoop()
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.udpReadLoop() }()
 
 	// Start gossip engine
 	n.gossipEng.Start()
@@ -298,16 +341,20 @@ func (n *Node) Start() error {
 	}
 
 	// Start session GC
-	go n.sessionGCLoop()
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.sessionGCLoop() }()
 
 	// Start route GC
-	go n.routeGCLoop()
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.routeGCLoop() }()
 
 	// Accept incoming connections
-	go n.acceptLoop()
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.acceptLoop() }()
 
 	// Connect to bootstrap peers
-	go n.bootstrap()
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.bootstrap() }()
 
 	return nil
 }
@@ -316,22 +363,36 @@ func (n *Node) Start() error {
 func (n *Node) Stop() error {
 	n.cancel()
 
+	// Stop accepting new connections first
+	if n.transportLn != nil {
+		n.transportLn.Close()
+	}
+	if n.udpLn != nil {
+		n.udpLn.Close()
+	}
+
 	n.socks5Srv.Stop()
 	n.propagator.Stop()
 	n.gossipEng.Stop()
 
+	// Close all peer connections
 	n.peerConnsMu.Lock()
 	for _, conn := range n.peerConns {
 		conn.Close()
 	}
 	n.peerConnsMu.Unlock()
 
-	if n.transportLn != nil {
-		n.transportLn.Close()
-	}
-
-	if n.udpLn != nil {
-		n.udpLn.Close()
+	// Wait for goroutines to finish with a timeout
+	done := make(chan struct{})
+	go func() {
+		n.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("node: shutdown complete")
+	case <-time.After(5 * time.Second):
+		log.Printf("node: shutdown timed out waiting for goroutines")
 	}
 
 	return nil
@@ -348,6 +409,11 @@ func (n *Node) acceptLoop() {
 				log.Printf("node: accept error: %v", err)
 				continue
 			}
+		}
+		if !n.acceptLimiter.allow() {
+			log.Printf("node: rate limiting incoming connection from %s", conn.RemoteAddr())
+			conn.Close()
+			continue
 		}
 		go n.handleIncomingConn(conn)
 	}
