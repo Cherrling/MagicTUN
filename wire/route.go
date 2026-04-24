@@ -24,10 +24,14 @@ const (
 // EncodeRouteMessage encodes a route message to bytes.
 func EncodeRouteMessage(msg *RouteMessage) []byte {
 	ones, _ := msg.Prefix.Mask.Size()
-	prefixLen := (ones + 7) / 8
-	// type(1) + flags(1) + prefixLen(1) + prefix(variable) + cost(4) +
+	isV4 := msg.Prefix.IP.To4() != nil
+	addrLen := 4
+	if !isV4 {
+		addrLen = 16
+	}
+	// type(1) + flags(1) + prefixLen(1) + addrFamily(1) + prefix(4 or 16) + cost(4) +
 	// origin(16) + localPref(4) + asPathLen(2) + asPath(N*16)
-	size := 1 + 1 + 1 + prefixLen + 4 + 16 + 4 + 2 + len(msg.ASPath)*NodeIDSize
+	size := 1 + 1 + 1 + 1 + addrLen + 4 + 16 + 4 + 2 + len(msg.ASPath)*NodeIDSize
 	buf := make([]byte, size)
 	off := 0
 
@@ -37,12 +41,17 @@ func EncodeRouteMessage(msg *RouteMessage) []byte {
 	off++
 	buf[off] = byte(ones)
 	off++
-	ip := msg.Prefix.IP.To4()
-	if ip == nil {
-		ip = msg.Prefix.IP.To16()
+	if isV4 {
+		buf[off] = 4 // IPv4
+		off++
+		copy(buf[off:], msg.Prefix.IP.To4())
+		off += 4
+	} else {
+		buf[off] = 6 // IPv6
+		off++
+		copy(buf[off:], msg.Prefix.IP.To16())
+		off += 16
 	}
-	copy(buf[off:], ip)
-	off += prefixLen
 
 	binary.BigEndian.PutUint32(buf[off:], msg.Cost)
 	off += 4
@@ -61,7 +70,7 @@ func EncodeRouteMessage(msg *RouteMessage) []byte {
 
 // DecodeRouteMessage decodes a route message from bytes.
 func DecodeRouteMessage(data []byte) (*RouteMessage, error) {
-	if len(data) < 1+1+1+4+16+4+2 {
+	if len(data) < 1+1+1+1+4+4+16+4+2 {
 		return nil, fmt.Errorf("route message too short: %d bytes", len(data))
 	}
 	off := 0
@@ -77,20 +86,32 @@ func DecodeRouteMessage(data []byte) (*RouteMessage, error) {
 
 	ones := int(data[off])
 	off++
-	prefixLen := (ones + 7) / 8
-	if off+prefixLen > len(data) {
-		return nil, fmt.Errorf("route message truncated at prefix")
-	}
+
+	addrFamily := data[off]
+	off++
+
+	var addrLen int
 	var ip net.IP
-	if ones <= 32 {
+	switch addrFamily {
+	case 4:
+		addrLen = 4
+		if off+4 > len(data) {
+			return nil, fmt.Errorf("route message truncated at IPv4 prefix")
+		}
 		ip = net.IPv4(data[off], data[off+1], data[off+2], data[off+3])
 		msg.Prefix = net.IPNet{IP: ip, Mask: net.CIDRMask(ones, 32)}
-	} else {
+	case 6:
+		addrLen = 16
+		if off+16 > len(data) {
+			return nil, fmt.Errorf("route message truncated at IPv6 prefix")
+		}
 		ip = make(net.IP, 16)
-		copy(ip, data[off:off+prefixLen])
+		copy(ip, data[off:off+16])
 		msg.Prefix = net.IPNet{IP: ip, Mask: net.CIDRMask(ones, 128)}
+	default:
+		return nil, fmt.Errorf("unknown address family: %d", addrFamily)
 	}
-	off += prefixLen
+	off += addrLen
 
 	msg.Cost = binary.BigEndian.Uint32(data[off:])
 	off += 4
