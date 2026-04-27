@@ -113,6 +113,43 @@ func (c *Config) Validate() error {
 	if c.Node.Socks5Addr == "" {
 		return fmt.Errorf("node.socks5_addr is required")
 	}
+	// Validate duration strings early to avoid silent zero values.
+	if c.Routing.RouteAdvertisementIntervalS != "" {
+		if _, err := time.ParseDuration(c.Routing.RouteAdvertisementIntervalS); err != nil {
+			return fmt.Errorf("invalid routing.route_advertisement_interval %q: %w", c.Routing.RouteAdvertisementIntervalS, err)
+		}
+	}
+	if c.Gossip.PushIntervalS != "" {
+		if _, err := time.ParseDuration(c.Gossip.PushIntervalS); err != nil {
+			return fmt.Errorf("invalid gossip.push_interval %q: %w", c.Gossip.PushIntervalS, err)
+		}
+	}
+	if c.Gossip.PeerTimeoutS != "" {
+		if _, err := time.ParseDuration(c.Gossip.PeerTimeoutS); err != nil {
+			return fmt.Errorf("invalid gossip.peer_timeout %q: %w", c.Gossip.PeerTimeoutS, err)
+		}
+	}
+	if c.Gossip.ProbeIntervalS != "" {
+		if _, err := time.ParseDuration(c.Gossip.ProbeIntervalS); err != nil {
+			return fmt.Errorf("invalid gossip.probe_interval %q: %w", c.Gossip.ProbeIntervalS, err)
+		}
+	}
+	if c.UDP.SessionTTLS != "" {
+		if _, err := time.ParseDuration(c.UDP.SessionTTLS); err != nil {
+			return fmt.Errorf("invalid udp.session_ttl %q: %w", c.UDP.SessionTTLS, err)
+		}
+	}
+	if c.UDP.SessionGCInterval != "" {
+		if _, err := time.ParseDuration(c.UDP.SessionGCInterval); err != nil {
+			return fmt.Errorf("invalid udp.session_gc_interval %q: %w", c.UDP.SessionGCInterval, err)
+		}
+	}
+	if c.Gossip.Fanout < 0 {
+		return fmt.Errorf("gossip.fanout must be >= 0")
+	}
+	if c.UDP.MaxDatagramSize < 0 {
+		return fmt.Errorf("udp.max_datagram_size must be >= 0")
+	}
 	for _, nw := range c.Routing.DirectNetworks {
 		if _, _, err := net.ParseCIDR(nw); err != nil {
 			return fmt.Errorf("invalid direct_network %q: %w", nw, err)

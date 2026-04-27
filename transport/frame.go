@@ -30,6 +30,20 @@ type Frame struct {
 	Payload  []byte
 }
 
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
 // WriteFrame writes a frame to a writer.
 func WriteFrame(w io.Writer, f *Frame) error {
 	if len(f.Payload) > maxFrameSize {
@@ -40,10 +54,10 @@ func WriteFrame(w io.Writer, f *Frame) error {
 	binary.BigEndian.PutUint32(header[1:], f.StreamID)
 	binary.BigEndian.PutUint32(header[5:], uint32(len(f.Payload)))
 
-	if _, err := w.Write(header); err != nil {
+	if err := writeFull(w, header); err != nil {
 		return err
 	}
-	if _, err := w.Write(f.Payload); err != nil {
+	if err := writeFull(w, f.Payload); err != nil {
 		return err
 	}
 	return nil

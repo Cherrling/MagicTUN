@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"github.com/example/magictun/transport"
 	"github.com/example/magictun/wire"
 )
+
+var seedRandOnce sync.Once
 
 // Node is the top-level orchestrator that wires together all subsystems.
 type Node struct {
@@ -76,6 +79,54 @@ type rateLimiter struct {
 	last     time.Time
 }
 
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// jitterDuration returns a duration in [base/2, base].
+// This reduces synchronized reconnect storms across nodes.
+func jitterDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	half := base / 2
+	if half <= 0 {
+		return base
+	}
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+func (n *Node) tryMarkDialing(addr string) bool {
+	n.reconnectingMu.Lock()
+	defer n.reconnectingMu.Unlock()
+	if _, already := n.reconnecting[addr]; already {
+		return false
+	}
+	n.reconnecting[addr] = struct{}{}
+	return true
+}
+
+func (n *Node) unmarkDialing(addr string) {
+	n.reconnectingMu.Lock()
+	delete(n.reconnecting, addr)
+	n.reconnectingMu.Unlock()
+}
+
 func newRateLimiter(maxPerInterval int, interval time.Duration) *rateLimiter {
 	return &rateLimiter{
 		tokens:   maxPerInterval,
@@ -104,6 +155,10 @@ func (rl *rateLimiter) allow() bool {
 
 // New creates a new Node from a configuration.
 func New(cfg *config.Config) (*Node, error) {
+	seedRandOnce.Do(func() {
+		rand.Seed(time.Now().UnixNano())
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Load or create identity
@@ -487,7 +542,7 @@ func (n *Node) handleIncomingConn(conn *transport.Conn) {
 	// Start handling incoming streams for TCP relay
 	go n.handleIncomingStreams(peerID, conn)
 
-	n.handleControlMessages(peerID, conn, buf[:nread])
+	n.handleControlMessages(peerID, conn, buf[:nread], true)
 }
 
 func (n *Node) connectToPeer(peerID identity.NodeID, addr string) {
@@ -497,16 +552,29 @@ func (n *Node) connectToPeer(peerID identity.NodeID, addr string) {
 	if exists {
 		return
 	}
+	if !n.tryMarkDialing(addr) {
+		return
+	}
 
 	log.Printf("node: connecting to peer %s at %s", peerID, addr)
 
 	conn, err := transport.Dial(addr, n.tlsCfg, nil) // PinStore disabled: TLS certs are ephemeral
 	if err != nil {
 		log.Printf("node: dial peer %s failed: %v", peerID, err)
+		n.unmarkDialing(addr)
+		// Retry with backoff in the background to reduce manual intervention.
+		go n.reconnectPeer(peerID)
 		return
 	}
+	n.unmarkDialing(addr)
 
+	// Double-check in case another goroutine connected while we were dialing.
 	n.peerConnsMu.Lock()
+	if _, ok := n.peerConns[peerID.String()]; ok {
+		n.peerConnsMu.Unlock()
+		conn.Close()
+		return
+	}
 	n.peerConns[peerID.String()] = conn
 	n.peerConnsMu.Unlock()
 
@@ -525,10 +593,10 @@ func (n *Node) connectToPeer(peerID identity.NodeID, addr string) {
 	go n.handleIncomingStreams(peerID, conn)
 
 	// Read control messages
-	n.handleControlMessages(peerID, conn, nil)
+	n.handleControlMessages(peerID, conn, nil, true)
 }
 
-func (n *Node) handleControlMessages(peerID identity.NodeID, conn *transport.Conn, initialData []byte) {
+func (n *Node) handleControlMessages(peerID identity.NodeID, conn *transport.Conn, initialData []byte, autoReconnect bool) {
 	cs := conn.ControlStream()
 	buf := make([]byte, 65536)
 
@@ -547,9 +615,10 @@ func (n *Node) handleControlMessages(peerID identity.NodeID, conn *transport.Con
 			n.gossipEng.RemoveDirectConnection(peerID)
 			n.peers.MarkDead(peerID)
 			n.propagator.WithdrawAllFromPeer(peerID)
-
-			// Try to reconnect
-			go n.reconnectPeer(peerID)
+			if autoReconnect {
+				// Try to reconnect in background (with backoff).
+				go n.reconnectPeer(peerID)
+			}
 			return
 		}
 		n.dispatchControlMsg(peerID, buf[:nread])
@@ -651,22 +720,14 @@ func (n *Node) reconnectPeer(peerID identity.NodeID) {
 	}
 	addr := peer.Addr
 
-	n.reconnectingMu.Lock()
-	if _, already := n.reconnecting[addr]; already {
-		n.reconnectingMu.Unlock()
+	if !n.tryMarkDialing(addr) {
 		return
 	}
-	n.reconnecting[addr] = struct{}{}
-	n.reconnectingMu.Unlock()
-
-	defer func() {
-		n.reconnectingMu.Lock()
-		delete(n.reconnecting, addr)
-		n.reconnectingMu.Unlock()
-	}()
+	defer n.unmarkDialing(addr)
 
 	backoff := 1 * time.Second
 	maxBackoff := 60 * time.Second
+	attempt := 0
 
 	for {
 		select {
@@ -675,21 +736,31 @@ func (n *Node) reconnectPeer(peerID identity.NodeID) {
 		default:
 		}
 
-		// Check if peer is still known and alive
-		if p, ok := n.peers.Get(peerID); !ok || p.State == gossip.PeerDead {
+		// Refresh address from gossip (in case it changed).
+		if p, ok := n.peers.Get(peerID); !ok || p.Addr == "" {
 			return
+		} else {
+			addr = p.Addr
 		}
 
-		// Check if already reconnected
+		// If already connected, nothing to do.
 		if conn := n.getPeerConn(peerID); conn != nil && !conn.IsClosed() {
 			return
 		}
 
-		log.Printf("node: reconnecting to %s (backoff %v)", peerID, backoff)
+		if attempt == 0 || attempt%5 == 0 {
+			log.Printf("node: reconnecting to %s (backoff %v)", peerID, backoff)
+		}
 		conn, err := transport.Dial(addr, n.tlsCfg, nil)
 		if err != nil {
-			log.Printf("node: reconnect to %s failed: %v", peerID, err)
-			time.Sleep(backoff)
+			if attempt == 0 || attempt%5 == 0 {
+				log.Printf("node: reconnect to %s failed: %v", peerID, err)
+			}
+			delay := jitterDuration(backoff)
+			attempt++
+			if !sleepWithContext(n.ctx, delay) {
+				return
+			}
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
@@ -697,7 +768,13 @@ func (n *Node) reconnectPeer(peerID identity.NodeID) {
 			continue
 		}
 
+		// Another goroutine might have connected while we were dialing.
 		n.peerConnsMu.Lock()
+		if existing, ok := n.peerConns[peerID.String()]; ok && existing != nil && !existing.IsClosed() {
+			n.peerConnsMu.Unlock()
+			conn.Close()
+			return
+		}
 		n.peerConns[peerID.String()] = conn
 		n.peerConnsMu.Unlock()
 
@@ -710,31 +787,78 @@ func (n *Node) reconnectPeer(peerID identity.NodeID) {
 		n.propagator.AdvertiseDirectNetworks()
 
 		go n.handleIncomingStreams(peerID, conn)
-		n.handleControlMessages(peerID, conn, nil)
-		return
+		// Keep this goroutine as the reconnect manager; do not spawn another on disconnect.
+		n.handleControlMessages(peerID, conn, nil, false)
+
+		// Connection dropped; reset backoff for next reconnect cycle.
+		backoff = 1 * time.Second
+		attempt = 0
 	}
 }
 
 func (n *Node) bootstrap() {
 	for _, bp := range n.cfg.Gossip.BootstrapPeers {
 		addr := bp
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			n.bootstrapPeer(addr)
+		}()
+	}
+}
+
+func (n *Node) bootstrapPeer(addr string) {
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+	attempt := 0
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		default:
+		}
+
+		if attempt == 0 || attempt%5 == 0 {
+			log.Printf("node: bootstrapping to %s", addr)
+		}
 		conn, err := transport.Dial(addr, n.tlsCfg, nil) // PinStore disabled: TLS certs are ephemeral
 		if err != nil {
-			log.Printf("node: bootstrap dial %s failed: %v", addr, err)
+			if attempt == 0 || attempt%5 == 0 {
+				log.Printf("node: bootstrap dial %s failed: %v", addr, err)
+			}
+			delay := jitterDuration(backoff)
+			attempt++
+			if !sleepWithContext(n.ctx, delay) {
+				return
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 			continue
 		}
 
-		// Send our gossip push first so the remote can identify us
+		// Send our gossip push first so the remote can identify us.
 		cs := conn.ControlStream()
-		push := n.buildSelfGossipPush()
-		cs.Write(push)
+		_, _ = cs.Write(n.buildSelfGossipPush())
 
-		// Now read the remote's gossip push to learn their identity
+		// Read the remote's gossip push to learn their identity.
 		buf := make([]byte, 65536)
 		nread, err := cs.Read(buf)
 		if err != nil {
 			log.Printf("node: bootstrap read from %s failed: %v", addr, err)
 			conn.Close()
+			// Retry.
+			delay := jitterDuration(backoff)
+			attempt++
+			if !sleepWithContext(n.ctx, delay) {
+				return
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 			continue
 		}
 
@@ -745,26 +869,39 @@ func (n *Node) bootstrap() {
 				copy(peerID[:], msg.Peers[0].ID[:])
 			}
 		}
-
 		if peerID.IsZero() {
 			log.Printf("node: bootstrap could not identify peer at %s", addr)
 			conn.Close()
+			// Retry.
+			delay := jitterDuration(backoff)
+			attempt++
+			if !sleepWithContext(n.ctx, delay) {
+				return
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 			continue
 		}
 
-		log.Printf("node: bootstrap connected to %s", peerID)
-
+		// If we already have a live connection, drop this duplicate.
 		n.peerConnsMu.Lock()
+		if existing, ok := n.peerConns[peerID.String()]; ok && existing != nil && !existing.IsClosed() {
+			n.peerConnsMu.Unlock()
+			conn.Close()
+			return
+		}
 		n.peerConns[peerID.String()] = conn
 		n.peerConnsMu.Unlock()
 
+		log.Printf("node: bootstrap connected to %s", peerID)
 		n.gossipEng.AddDirectConnection(peerID, conn)
 		n.registerPeerUDPAddr(peerID, addr)
 
-		// Start handling incoming streams for TCP relay
 		go n.handleIncomingStreams(peerID, conn)
-
-		go n.handleControlMessages(peerID, conn, buf[:nread])
+		go n.handleControlMessages(peerID, conn, buf[:nread], true)
+		return
 	}
 }
 

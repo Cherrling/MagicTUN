@@ -51,7 +51,19 @@ func (s *Server) handleHandshake(conn net.Conn) (*SocksRequest, error) {
 		return nil, fmt.Errorf("read methods: %w", err)
 	}
 
-	// Accept no-auth
+	// Method selection: only accept no-auth if client offered it.
+	noAuthOffered := false
+	for _, m := range methods {
+		if m == authNone {
+			noAuthOffered = true
+			break
+		}
+	}
+	if !noAuthOffered {
+		// No acceptable methods.
+		_, _ = conn.Write([]byte{socks5Version, authNoAccept})
+		return nil, fmt.Errorf("no acceptable auth methods")
+	}
 	if _, err := conn.Write([]byte{socks5Version, authNone}); err != nil {
 		return nil, fmt.Errorf("write auth response: %w", err)
 	}
